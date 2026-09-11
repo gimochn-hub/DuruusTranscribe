@@ -35,13 +35,11 @@ def validate_youtube_url(url: str) -> Dict[str, Any]:
         'no_warnings': True,
         'extract_flat': False,
         'skip_download': True,
+        'nocheckcertificate': True,
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'web'],
+                'player_client': ['android'],
             }
-        },
-        'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
         },
     }
     if cookies_file.exists():
@@ -109,68 +107,81 @@ def download_youtube_audio(
                 progress_callback(percent, f"Mengunduh audio dari YouTube... {percent:.0f}%{speed_str}")
 
     cookies_file = Path(__file__).resolve().parent.parent.parent / "cookies.txt"
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'outtmpl': output_path_template,
-        'quiet': True,
-        'no_warnings': True,
-        'progress_hooks': [ydl_progress_hook],
-        'postprocessors': [], # Keep raw audio download, converter.py will handle ffmpeg to .opus
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['android', 'web'],
-            }
-        },
-        'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-        },
-        'socket_timeout': 30,
-        'retries': 5,
-        'fragment_retries': 10,
-    }
-    if cookies_file.exists():
-        ydl_opts['cookiefile'] = str(cookies_file)
+    
+    # Try clients in order of cloud-compatibility
+    client_candidates = [
+        ['android'],
+        ['tv_embedded'],
+        ['android', 'ios'],
+        None  # default fallback
+    ]
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            if progress_callback:
-                progress_callback(5.0, "Memulai unduhan audio dari YouTube...")
-            
-            info = ydl.extract_info(url, download=True)
-            if not info:
-                raise DownloadError("Gagal mengunduh audio dari YouTube.")
+    last_error = None
+    for client_list in client_candidates:
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'outtmpl': output_path_template,
+            'quiet': True,
+            'no_warnings': True,
+            'progress_hooks': [ydl_progress_hook],
+            'postprocessors': [],
+            'nocheckcertificate': True,
+            'socket_timeout': 30,
+            'retries': 5,
+            'fragment_retries': 10,
+        }
+        if client_list:
+            ydl_opts['extractor_args'] = {'youtube': {'player_client': client_list}}
+        if cookies_file.exists():
+            ydl_opts['cookiefile'] = str(cookies_file)
 
-            filename = ydl.prepare_filename(info)
-            if not os.path.exists(filename):
-                # Search for any file with id in output_dir
-                vid_id = info.get('id', '')
-                matching = [f for f in os.listdir(output_dir) if vid_id in f]
-                if matching:
-                    filename = os.path.join(output_dir, matching[0])
-                else:
-                    raise DownloadError("File audio hasil unduhan tidak ditemukan di server.")
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                if progress_callback:
+                    progress_callback(5.0, "Memulai unduhan audio dari YouTube...")
+                
+                info = ydl.extract_info(url, download=True)
+                if not info:
+                    raise DownloadError("Gagal mengunduh audio dari YouTube.")
 
-            if progress_callback:
-                progress_callback(100.0, "Unduhan audio YouTube selesai.")
+                filename = ydl.prepare_filename(info)
+                if not os.path.exists(filename):
+                    # Search for any file with id in output_dir
+                    vid_id = info.get('id', '')
+                    matching = [f for f in os.listdir(output_dir) if vid_id in f]
+                    if matching:
+                        filename = os.path.join(output_dir, matching[0])
+                    else:
+                        raise DownloadError("File audio hasil unduhan tidak ditemukan di server.")
 
-            return {
-                'file_path': filename,
-                'title': info.get('title', 'Kajian Tanpa Judul'),
-                'uploader': info.get('uploader') or info.get('channel') or '',
-                'duration': info.get('duration', 0),
-                'webpage_url': info.get('webpage_url', url)
-            }
-    except yt_dlp.utils.DownloadError as e:
-        error_msg = str(e).lower()
-        if "private video" in error_msg:
-            raise DownloadError("Video bersifat privat dan tidak dapat diakses.")
-        elif "sign in" in error_msg:
-            raise DownloadError("Video memerlukan autentikasi login YouTube.")
-        elif "region" in error_msg:
-            raise DownloadError("Video dibatasi wilayah geografis.")
-        else:
-            raise DownloadError(f"Gagal mengunduh audio YouTube: {str(e)}")
-    except Exception as e:
-        if isinstance(e, DownloadError):
-            raise
-        raise DownloadError(f"Terjadi kesalahan saat mengunduh audio: {str(e)}")
+                if progress_callback:
+                    progress_callback(100.0, "Unduhan audio YouTube selesai.")
+
+                return {
+                    'file_path': filename,
+                    'title': info.get('title', 'Kajian Tanpa Judul'),
+                    'uploader': info.get('uploader') or info.get('channel') or '',
+                    'duration': info.get('duration', 0),
+                    'webpage_url': info.get('webpage_url', url)
+                }
+        except yt_dlp.utils.DownloadError as e:
+            error_msg = str(e).lower()
+            last_error = e
+            if "private video" in error_msg:
+                raise DownloadError("Video bersifat privat dan tidak dapat diakses.")
+            elif "sign in" in error_msg:
+                raise DownloadError("Video memerlukan autentikasi login YouTube.")
+            elif "region" in error_msg:
+                raise DownloadError("Video dibatasi wilayah geografis.")
+            # If 403 or unavailable, continue loop to try next client
+            continue
+        except Exception as e:
+            if isinstance(e, DownloadError):
+                raise
+            last_error = e
+            continue
+
+    if last_error:
+        raise DownloadError(f"Gagal mengunduh audio YouTube: {str(last_error)}")
+    raise DownloadError("Gagal mengunduh audio YouTube setelah mencoba beberapa metode.")
+
